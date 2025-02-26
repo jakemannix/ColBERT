@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colbert-ai"
+version = "0.2.20"
+description = "Efficient and Effective Passage Search via Contextualized Late Interaction over BERT"
+readme = "README.md"
+authors = [
+    {name = "Omar Khattab", email = "okhattab@stanford.edu"},
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "bitarray",
+    "datasets",
+    "flask",
+    "git-python",
+    "python-dotenv",
+    "ninja",
+    "scipy",
+    "tqdm",
+    "transformers",
+    "ujson",
+]
+
+[project.optional-dependencies]
+faiss-gpu = ["faiss-gpu>=1.7.0"]
+faiss-cpu = ["faiss-cpu>=1.7.0"]
+torch = ["torch==1.13.1"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/stanford-futuredata/ColBERT"
+"Bug Tracker" = "https://github.com/stanford-futuredata/ColBERT/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

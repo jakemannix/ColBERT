@@ -23,15 +23,19 @@ def load_ranking(path):  # works with annotated and un-annotated ranked lists
 
 
 class Ranking:
-    def __init__(self, path=None, data=None, metrics=None, provenance=None):
+    def __init__(self, path=None, data=None, metrics=None, provenance=None, metadata=None):
         self.__provenance = provenance or path or Provenance()
         self.data = self._prepare_data(data or self._load_file(path))
+        self.metadata = metadata or {}
 
     def provenance(self):
         return self.__provenance
     
     def toDict(self):
-        return {'provenance': self.provenance()}
+        return {
+            'provenance': self.provenance(),
+            'metadata': self.metadata
+        }
 
     def _prepare_data(self, data):
         # TODO: Handle list of lists???
@@ -75,6 +79,11 @@ class Ranking:
             d = {}
             d['metadata'] = get_metadata_only()
             d['provenance'] = self.provenance()
+            
+            # Include any custom metadata
+            if self.metadata:
+                d['custom_metadata'] = self.metadata
+                
             line = ujson.dumps(d, indent=4)
             f.write(line)
         
