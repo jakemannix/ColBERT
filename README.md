@@ -224,6 +224,73 @@ A sample query:
 http://localhost:8893/api/search?query=Who won the 2022 FIFA world cup&k=25
 ```
 
+## Metadata and Faceted Search
+
+ColBERT supports metadata-based filtering and faceted search to enhance retrieval capabilities. This allows you to:
+
+1. Store and retrieve metadata alongside passages
+2. Filter search results based on metadata fields
+3. Compute facet counts for search results
+
+### Metadata Storage
+
+Metadata can be stored in JSONL format:
+
+```json
+{"pid": 0, "passage": "Document text", "metadata": {"category": "science", "year": 2022}}
+```
+
+### Metadata Filtering
+
+Filter results based on metadata fields:
+
+```python
+# Filter by exact match
+results = searcher.search("quantum physics", facet_filters={"category": "science"})
+
+# Filter by list of values
+results = searcher.search("election analysis", facet_filters={"category": ["politics", "news"]})
+
+# Filter by numeric range
+results = searcher.search("recent discoveries", facet_filters={"year": ">=2020"})
+
+# Combine multiple filters
+results = searcher.search("recent research", facet_filters={
+    "category": "science", 
+    "year": ">=2020",
+    "author": ["Smith", "Jones"]
+})
+```
+
+### Faceted Search
+
+Compute facet counts for search results:
+
+```python
+# Return facet counts along with search results
+pids, ranks, scores, facets = searcher.search(
+    "climate change",
+    k=100,
+    facet_fields=["category", "year", "source"]
+)
+
+# Access facet counts
+print(f"Categories: {facets['category']}")  # {'science': 42, 'news': 12, ...}
+print(f"Years: {facets['year']}")  # {'2022': 15, '2021': 25, ...}
+```
+
+### Benchmark
+
+To run the faceting benchmark:
+
+```bash
+# Generate synthetic benchmark data
+python scripts/create_faceting_benchmark_data.py --output-dir=tests/data/faceting_benchmark --num-passages=10000
+
+# Run benchmark tests
+python -m pytest tests/test_faceting_benchmark.py -v --benchmark-data-dir=tests/data/faceting_benchmark
+```
+
 ## Branches
 
 ### Supported branches
