@@ -1,0 +1,3 @@
+# Ignore synthetic test data
+**/synthetic_collection.jsonl
+**/dataset_metadata.json
