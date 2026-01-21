@@ -54,11 +54,151 @@ from dataclasses import dataclass, field
 class FieldSchema:
     """Schema for a single metadata field."""
     name: str
-    dtype: str  # 'categorical', 'int', 'float'
+    dtype: str  # 'categorical', 'int', 'float', 'multi_categorical'
     vocab: Optional[Dict[str, int]] = None  # For categorical fields
     vocab_inverse: Optional[Dict[int, str]] = None
-    tensor: Optional[torch.Tensor] = None
+    tensor: Optional[torch.Tensor] = None  # For single-value fields
+    inverted_index: Optional['GPUInvertedIndex'] = None  # For multi-value fields
     default_value: Any = None
+
+
+class GPUInvertedIndex:
+    """
+    GPU-resident inverted index for multi-value fields (e.g., tags).
+
+    Stores posting lists as GPU tensors for O(1) lookup of all PIDs
+    with a given value. Much more efficient than padded tensors for
+    sparse multi-value fields.
+
+    Memory: O(total_assignments) vs O(n_docs * max_values) for padded
+    """
+
+    def __init__(self, device: str = 'cuda'):
+        self.device = device
+        self.vocab: Dict[str, int] = {}
+        self.vocab_inverse: Dict[int, str] = {}
+        self.posting_lists: Dict[int, torch.Tensor] = {}  # value_id -> PIDs tensor
+        self.pid_to_values: Optional[torch.Tensor] = None  # For reverse lookup (optional)
+
+    @classmethod
+    def from_metadata(cls, collection, field_name: str,
+                      device: str = 'cuda') -> 'GPUInvertedIndex':
+        """
+        Build inverted index from collection metadata.
+
+        Args:
+            collection: Collection with .metadata dict
+            field_name: Name of multi-value field (e.g., 'tags')
+            device: 'cuda' or 'cpu'
+        """
+        index = cls(device=device)
+
+        # First pass: build vocabulary and collect postings
+        postings: Dict[str, List[int]] = {}  # value -> list of PIDs
+
+        for pid in range(len(collection)):
+            meta = collection.get_metadata(pid)
+            values = meta.get(field_name, [])
+
+            # Handle both list and single values
+            if not isinstance(values, (list, tuple)):
+                values = [values] if values else []
+
+            for value in values:
+                value_str = str(value)
+                if value_str not in postings:
+                    postings[value_str] = []
+                postings[value_str].append(pid)
+
+        # Build vocabulary
+        for value_str in sorted(postings.keys()):
+            value_id = len(index.vocab)
+            index.vocab[value_str] = value_id
+            index.vocab_inverse[value_id] = value_str
+
+        # Convert posting lists to GPU tensors
+        for value_str, pids in postings.items():
+            value_id = index.vocab[value_str]
+            index.posting_lists[value_id] = torch.tensor(
+                pids, dtype=torch.int32, device=device
+            )
+
+        return index
+
+    def get_pids_for_value(self, value: str) -> torch.Tensor:
+        """Get all PIDs that have the given value."""
+        value_id = self.vocab.get(value)
+        if value_id is None:
+            return torch.tensor([], dtype=torch.int32, device=self.device)
+        return self.posting_lists.get(value_id,
+            torch.tensor([], dtype=torch.int32, device=self.device))
+
+    def get_pids_for_any_value(self, values: List[str]) -> torch.Tensor:
+        """Get all PIDs that have ANY of the given values (OR)."""
+        all_pids = []
+        for value in values:
+            pids = self.get_pids_for_value(value)
+            if len(pids) > 0:
+                all_pids.append(pids)
+
+        if not all_pids:
+            return torch.tensor([], dtype=torch.int32, device=self.device)
+
+        # Union of all posting lists
+        return torch.cat(all_pids).unique()
+
+    def get_pids_for_all_values(self, values: List[str]) -> torch.Tensor:
+        """Get all PIDs that have ALL of the given values (AND)."""
+        if not values:
+            return torch.tensor([], dtype=torch.int32, device=self.device)
+
+        # Start with first value's posting list
+        result = self.get_pids_for_value(values[0])
+
+        # Intersect with remaining values
+        for value in values[1:]:
+            other_pids = self.get_pids_for_value(value)
+            # Intersection via isin
+            mask = torch.isin(result, other_pids)
+            result = result[mask]
+
+            if len(result) == 0:
+                break
+
+        return result
+
+    def filter_candidates_has_value(self, candidates: torch.Tensor,
+                                     value: str) -> torch.Tensor:
+        """Filter candidates to those having the given value."""
+        matching_pids = self.get_pids_for_value(value)
+        mask = torch.isin(candidates, matching_pids)
+        return candidates[mask]
+
+    def filter_candidates_has_any(self, candidates: torch.Tensor,
+                                   values: List[str]) -> torch.Tensor:
+        """Filter candidates to those having ANY of the given values."""
+        matching_pids = self.get_pids_for_any_value(values)
+        mask = torch.isin(candidates, matching_pids)
+        return candidates[mask]
+
+    def memory_usage(self) -> int:
+        """Return total memory usage in bytes."""
+        total = 0
+        for tensor in self.posting_lists.values():
+            total += tensor.element_size() * tensor.numel()
+        return total
+
+    def stats(self) -> Dict[str, Any]:
+        """Return statistics about the inverted index."""
+        posting_sizes = [len(t) for t in self.posting_lists.values()]
+        return {
+            'n_values': len(self.vocab),
+            'total_postings': sum(posting_sizes),
+            'avg_posting_size': sum(posting_sizes) / len(posting_sizes) if posting_sizes else 0,
+            'max_posting_size': max(posting_sizes) if posting_sizes else 0,
+            'min_posting_size': min(posting_sizes) if posting_sizes else 0,
+            'memory_bytes': self.memory_usage(),
+        }
 
 
 class GPUMetadataStore:
@@ -89,7 +229,12 @@ class GPUMetadataStore:
         Example:
             store = GPUMetadataStore.from_collection(
                 collection,
-                {'category': 'categorical', 'year': 'int', 'score': 'float'}
+                {
+                    'category': 'categorical',
+                    'year': 'int',
+                    'score': 'float',
+                    'tags': 'multi_categorical'  # Multi-value field
+                }
             )
         """
         store = cls(device=device)
@@ -157,8 +302,29 @@ class GPUMetadataStore:
                     default_value=0.0
                 )
 
+            elif dtype == 'multi_categorical':
+                # Build inverted index for multi-value field
+                inverted_index = GPUInvertedIndex.from_metadata(
+                    collection, field_name, device=device
+                )
+                store.fields[field_name] = FieldSchema(
+                    name=field_name,
+                    dtype='multi_categorical',
+                    vocab=inverted_index.vocab,
+                    vocab_inverse=inverted_index.vocab_inverse,
+                    inverted_index=inverted_index,
+                    default_value=[]
+                )
+
         store._initialized = True
         return store
+
+    def get_inverted_index(self, field_name: str) -> Optional[GPUInvertedIndex]:
+        """Get the inverted index for a multi-value field."""
+        schema = self.fields.get(field_name)
+        if schema and schema.dtype == 'multi_categorical':
+            return schema.inverted_index
+        return None
 
     def encode_filter_value(self, field_name: str, value: Any) -> Union[int, float, torch.Tensor]:
         """Convert a filter value to its tensor-compatible form."""
@@ -206,6 +372,9 @@ class FilterOp(Enum):
     LE = "le"           # <=
     IN = "in"           # in list
     NOT_IN = "not_in"   # not in list
+    HAS = "has"         # multi-value field contains value
+    HAS_ANY = "has_any" # multi-value field contains any of values
+    HAS_ALL = "has_all" # multi-value field contains all of values
 
 
 @dataclass
@@ -239,12 +408,24 @@ class GPUFilter:
             {"year": ">2020"}                 → GT
             {"year": "<2022"}                 → LT
             {"score": {"gte": 0.5}}           → GE (explicit form)
+
+        Multi-value fields (auto-detected from schema):
+            {"tags": "python"}                → HAS (single value)
+            {"tags": ["python", "ml"]}        → HAS_ANY (match any)
+            {"tags": {"all": ["python", "ml"]}} → HAS_ALL (match all)
         """
         conditions = []
 
         for field, value in filter_dict.items():
+            # Check if this is a multi-value field
+            schema = self.metadata_store.fields.get(field)
+            is_multi = schema and schema.dtype == 'multi_categorical'
+
             if isinstance(value, list):
-                conditions.append(FilterCondition(field, FilterOp.IN, value))
+                if is_multi:
+                    conditions.append(FilterCondition(field, FilterOp.HAS_ANY, value))
+                else:
+                    conditions.append(FilterCondition(field, FilterOp.IN, value))
 
             elif isinstance(value, str):
                 if value.startswith('>='):
@@ -256,16 +437,24 @@ class GPUFilter:
                 elif value.startswith('<'):
                     conditions.append(FilterCondition(field, FilterOp.LT, float(value[1:])))
                 else:
-                    # Exact string match (categorical)
-                    conditions.append(FilterCondition(field, FilterOp.EQ, value))
+                    # Exact string match (categorical) or HAS for multi-value
+                    if is_multi:
+                        conditions.append(FilterCondition(field, FilterOp.HAS, value))
+                    else:
+                        conditions.append(FilterCondition(field, FilterOp.EQ, value))
 
             elif isinstance(value, dict):
                 # Explicit operator form: {"field": {"gte": 5, "lt": 10}}
+                # Or multi-value: {"tags": {"all": ["a", "b"]}}
                 for op_name, op_value in value.items():
-                    op_map = {'eq': FilterOp.EQ, 'ne': FilterOp.NE,
-                              'gt': FilterOp.GT, 'gte': FilterOp.GE,
-                              'lt': FilterOp.LT, 'lte': FilterOp.LE,
-                              'in': FilterOp.IN, 'not_in': FilterOp.NOT_IN}
+                    op_map = {
+                        'eq': FilterOp.EQ, 'ne': FilterOp.NE,
+                        'gt': FilterOp.GT, 'gte': FilterOp.GE,
+                        'lt': FilterOp.LT, 'lte': FilterOp.LE,
+                        'in': FilterOp.IN, 'not_in': FilterOp.NOT_IN,
+                        'has': FilterOp.HAS, 'has_any': FilterOp.HAS_ANY,
+                        'all': FilterOp.HAS_ALL, 'has_all': FilterOp.HAS_ALL,
+                    }
                     conditions.append(FilterCondition(field, op_map[op_name], op_value))
 
             else:
@@ -320,6 +509,20 @@ class GPUFilter:
             elif cond.op == FilterOp.NOT_IN:
                 cond_mask = ~torch.isin(field_values, encoded_value)
 
+            # Multi-value field operators (use inverted index)
+            elif cond.op == FilterOp.HAS:
+                inverted_index = self.metadata_store.get_inverted_index(cond.field)
+                matching_pids = inverted_index.get_pids_for_value(cond.value)
+                cond_mask = torch.isin(pids, matching_pids)
+            elif cond.op == FilterOp.HAS_ANY:
+                inverted_index = self.metadata_store.get_inverted_index(cond.field)
+                matching_pids = inverted_index.get_pids_for_any_value(cond.value)
+                cond_mask = torch.isin(pids, matching_pids)
+            elif cond.op == FilterOp.HAS_ALL:
+                inverted_index = self.metadata_store.get_inverted_index(cond.field)
+                matching_pids = inverted_index.get_pids_for_all_values(cond.value)
+                cond_mask = torch.isin(pids, matching_pids)
+
             # AND with running mask
             mask &= cond_mask
 
@@ -340,7 +543,189 @@ class GPUFilter:
 
 ---
 
-## Component 3: Adaptive Retrieval with Selectivity Estimation
+## Component 3: Filter Cache
+
+```python
+import time
+from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+import torch
+import json
+
+
+@dataclass
+class CacheEntry:
+    """Entry in the filter cache."""
+    pids: torch.Tensor  # All PIDs matching this filter (corpus-wide)
+    selectivity: float  # Fraction of corpus matching
+    created_at: float   # Timestamp for TTL
+    hit_count: int = 0  # For LRU tracking
+
+
+class FilterCache:
+    """
+    Two-level cache for filter results:
+
+    Level 1: Corpus-wide filter results (for brute-force path)
+        - Caches: filter_signature -> all matching PIDs
+        - Huge win for selective filters that trigger brute-force mode
+        - Filter once, reuse until corpus changes
+
+    Level 2: Selectivity estimates
+        - Caches: filter_signature -> selectivity ratio
+        - Used to choose retrieval strategy without re-sampling
+        - Cheap to store, fast to compute initial estimate
+
+    Memory management:
+        - LRU eviction when cache exceeds max_entries
+        - TTL expiration for stale entries
+        - Memory budget enforcement
+    """
+
+    def __init__(self,
+                 max_entries: int = 1000,
+                 max_memory_bytes: int = 1_000_000_000,  # 1GB default
+                 ttl_seconds: float = 3600.0,  # 1 hour default
+                 device: str = 'cuda'):
+        self.max_entries = max_entries
+        self.max_memory_bytes = max_memory_bytes
+        self.ttl_seconds = ttl_seconds
+        self.device = device
+
+        # Level 1: Corpus-wide filter results
+        self._corpus_cache: Dict[str, CacheEntry] = {}
+
+        # Level 2: Selectivity estimates (cheap, keep more)
+        self._selectivity_cache: Dict[str, float] = {}
+
+        # Stats
+        self.hits = 0
+        self.misses = 0
+
+    def _filter_signature(self, filters: Dict[str, Any]) -> str:
+        """Create hashable signature for filter dict."""
+        return json.dumps(filters, sort_keys=True)
+
+    def get_corpus_result(self, filters: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Get cached corpus-wide filter result.
+
+        Returns:
+            Tensor of all PIDs matching filter, or None if not cached
+        """
+        sig = self._filter_signature(filters)
+        entry = self._corpus_cache.get(sig)
+
+        if entry is None:
+            self.misses += 1
+            return None
+
+        # Check TTL
+        if time.time() - entry.created_at > self.ttl_seconds:
+            del self._corpus_cache[sig]
+            self.misses += 1
+            return None
+
+        # Cache hit
+        entry.hit_count += 1
+        self.hits += 1
+        return entry.pids
+
+    def put_corpus_result(self, filters: Dict[str, Any],
+                          pids: torch.Tensor,
+                          selectivity: float):
+        """
+        Cache corpus-wide filter result.
+
+        Args:
+            filters: The filter specification
+            pids: All PIDs matching the filter
+            selectivity: Fraction of corpus matching (for stats)
+        """
+        sig = self._filter_signature(filters)
+
+        # Check memory budget before adding
+        entry_size = pids.element_size() * pids.numel()
+        if entry_size > self.max_memory_bytes * 0.1:
+            # Single entry too large (>10% of budget), don't cache
+            return
+
+        self._evict_if_needed(entry_size)
+
+        self._corpus_cache[sig] = CacheEntry(
+            pids=pids,
+            selectivity=selectivity,
+            created_at=time.time(),
+            hit_count=0
+        )
+
+        # Also update selectivity cache
+        self._selectivity_cache[sig] = selectivity
+
+    def get_selectivity(self, filters: Dict[str, Any]) -> Optional[float]:
+        """Get cached selectivity estimate."""
+        sig = self._filter_signature(filters)
+        return self._selectivity_cache.get(sig)
+
+    def put_selectivity(self, filters: Dict[str, Any], selectivity: float):
+        """Cache selectivity estimate."""
+        sig = self._filter_signature(filters)
+        self._selectivity_cache[sig] = selectivity
+
+    def _evict_if_needed(self, needed_bytes: int):
+        """Evict entries if over memory or count budget."""
+        # Check entry count
+        while len(self._corpus_cache) >= self.max_entries:
+            self._evict_lru()
+
+        # Check memory budget
+        current_memory = self._current_memory_usage()
+        while current_memory + needed_bytes > self.max_memory_bytes:
+            if not self._evict_lru():
+                break  # Nothing left to evict
+            current_memory = self._current_memory_usage()
+
+    def _evict_lru(self) -> bool:
+        """Evict least recently used entry. Returns True if evicted."""
+        if not self._corpus_cache:
+            return False
+
+        # Find LRU entry (lowest hit_count, oldest)
+        lru_sig = min(
+            self._corpus_cache.keys(),
+            key=lambda s: (self._corpus_cache[s].hit_count,
+                          -self._corpus_cache[s].created_at)
+        )
+        del self._corpus_cache[lru_sig]
+        return True
+
+    def _current_memory_usage(self) -> int:
+        """Calculate current memory usage in bytes."""
+        total = 0
+        for entry in self._corpus_cache.values():
+            total += entry.pids.element_size() * entry.pids.numel()
+        return total
+
+    def invalidate(self):
+        """Invalidate all cache entries (e.g., when corpus changes)."""
+        self._corpus_cache.clear()
+        self._selectivity_cache.clear()
+
+    def stats(self) -> Dict[str, Any]:
+        """Return cache statistics."""
+        return {
+            'corpus_cache_entries': len(self._corpus_cache),
+            'selectivity_cache_entries': len(self._selectivity_cache),
+            'memory_usage_bytes': self._current_memory_usage(),
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': self.hits / (self.hits + self.misses) if (self.hits + self.misses) > 0 else 0,
+        }
+```
+
+---
+
+## Component 4: Adaptive Retrieval with Selectivity Estimation
 
 ```python
 from dataclasses import dataclass
@@ -369,18 +754,21 @@ class AdaptiveFilteredRetrieval:
     Adaptive retrieval strategy that adjusts ncells based on filter selectivity.
 
     Strategy:
-    1. Start with ncells=1
-    2. Retrieve candidates, apply GPU filter
-    3. Estimate selectivity from filtered/total ratio
-    4. If not enough candidates, expand ncells and repeat
-    5. Stop when we have enough candidates OR exhausted max_ncells
+    1. Check cache for corpus-wide filter result (instant for selective filters)
+    2. If not cached, start with ncells=1
+    3. Retrieve candidates, apply GPU filter
+    4. Estimate selectivity from filtered/total ratio
+    5. If not enough candidates, expand ncells and repeat
+    6. Stop when we have enough candidates OR exhausted max_ncells
+    7. For very selective filters (<0.1%), switch to brute-force and cache result
 
-    For very selective filters (<0.1%), consider brute-force scoring instead.
+    Caching provides huge wins for repeated selective filters.
     """
 
     def __init__(self,
                  index_scorer,
                  gpu_filter: GPUFilter,
+                 filter_cache: Optional[FilterCache] = None,
                  min_candidates: int = 256,
                  max_ncells: int = 32,
                  selectivity_threshold_for_bruteforce: float = 0.001):
@@ -390,8 +778,8 @@ class AdaptiveFilteredRetrieval:
         self.max_ncells = max_ncells
         self.selectivity_threshold = selectivity_threshold_for_bruteforce
 
-        # Cache for selectivity estimates per filter signature
-        self._selectivity_cache: Dict[str, float] = {}
+        # Filter cache (create default if not provided)
+        self.cache = filter_cache or FilterCache()
 
     def _filter_signature(self, filters: Dict[str, Any]) -> str:
         """Create a hashable signature for a filter dict."""
@@ -425,11 +813,23 @@ class AdaptiveFilteredRetrieval:
         Returns:
             (filtered_pids, centroid_scores, stats)
         """
-        # Check cache for known selectivity
-        sig = self._filter_signature(filters)
-        cached_selectivity = self._selectivity_cache.get(sig)
+        # LEVEL 1 CACHE: Check for cached corpus-wide result
+        cached_pids = self.cache.get_corpus_result(filters)
+        if cached_pids is not None:
+            # Cache hit! Use cached PIDs directly (brute-force path)
+            selectivity = len(cached_pids) / self.gpu_filter.metadata_store.n_docs
+            stats = RetrievalStats(
+                ncells=0,  # 0 indicates cache hit / brute-force
+                candidates_before_filter=self.gpu_filter.metadata_store.n_docs,
+                candidates_after_filter=len(cached_pids),
+                selectivity=selectivity
+            )
+            return cached_pids, None, stats
 
-        # If we know selectivity is very low, consider brute-force
+        # LEVEL 2 CACHE: Check for cached selectivity estimate
+        cached_selectivity = self.cache.get_selectivity(filters)
+
+        # If we know selectivity is very low, go directly to brute-force
         if cached_selectivity is not None and cached_selectivity < self.selectivity_threshold:
             return self._bruteforce_filtered_retrieve(config, Q, filters, k)
 
@@ -453,7 +853,7 @@ class AdaptiveFilteredRetrieval:
             all_stats.append(stats)
 
             # Update selectivity cache
-            self._selectivity_cache[sig] = selectivity
+            self.cache.put_selectivity(filters, selectivity)
 
             # Check if we have enough candidates
             target = max(self.min_candidates, k * 4)
@@ -485,8 +885,22 @@ class AdaptiveFilteredRetrieval:
 
         This skips ANN retrieval entirely when the filter is so selective
         that brute-force scoring is faster than probing many centroids.
+
+        Results are cached for future queries with the same filter.
         """
         n_docs = self.gpu_filter.metadata_store.n_docs
+
+        # Check cache first (might have been populated by another query)
+        cached_pids = self.cache.get_corpus_result(filters)
+        if cached_pids is not None:
+            selectivity = len(cached_pids) / n_docs
+            stats = RetrievalStats(
+                ncells=0,
+                candidates_before_filter=n_docs,
+                candidates_after_filter=len(cached_pids),
+                selectivity=selectivity
+            )
+            return cached_pids, None, stats
 
         # Get ALL PIDs (as tensor)
         all_pids = torch.arange(n_docs, dtype=torch.int32,
@@ -495,11 +909,16 @@ class AdaptiveFilteredRetrieval:
         # Apply filter to entire corpus
         filtered_pids = self.gpu_filter.apply(all_pids, filters)
 
+        selectivity = len(filtered_pids) / n_docs
+
+        # CACHE the result for future queries with same filter
+        self.cache.put_corpus_result(filters, filtered_pids, selectivity)
+
         stats = RetrievalStats(
             ncells=0,  # 0 indicates brute-force mode
             candidates_before_filter=n_docs,
             candidates_after_filter=len(filtered_pids),
-            selectivity=len(filtered_pids) / n_docs
+            selectivity=selectivity
         )
 
         # No centroid scores in brute-force mode - will do full scoring
@@ -733,26 +1152,56 @@ This is negligible compared to:
 from colbert import Searcher
 from colbert.search.filtered import FilteredSearcher
 
-# Initialize with filterable fields
+# Initialize with filterable fields (including multi-value)
 searcher = FilteredSearcher(
     index="my_index",
     collection="my_collection.jsonl",
     filterable_fields={
-        'category': 'categorical',
-        'year': 'int',
-        'source': 'categorical',
-        'score': 'float'
+        'category': 'categorical',        # Single-value categorical
+        'year': 'int',                     # Integer
+        'source': 'categorical',           # Single-value categorical
+        'score': 'float',                  # Float
+        'tags': 'multi_categorical',       # Multi-value (uses inverted index)
+        'authors': 'multi_categorical',    # Multi-value
     }
 )
 
-# Search with filters
+# Search with filters on single-value fields
 pids, ranks, scores = searcher.search(
     "quantum computing applications",
     k=10,
     filters={
-        "category": ["science", "technology"],
+        "category": ["science", "technology"],  # IN filter
+        "year": ">=2020",                       # Range filter
+        "score": {"gte": 0.5}                   # Explicit operator
+    }
+)
+
+# Search with multi-value field filters
+pids, ranks, scores = searcher.search(
+    "deep learning frameworks",
+    k=10,
+    filters={
+        "tags": "python",                       # HAS: contains "python"
         "year": ">=2020",
-        "score": {"gte": 0.5}
+    }
+)
+
+# Multi-value OR filter: has any of these tags
+pids, ranks, scores = searcher.search(
+    "neural networks",
+    k=10,
+    filters={
+        "tags": ["pytorch", "tensorflow", "jax"],  # HAS_ANY: contains any
+    }
+)
+
+# Multi-value AND filter: has all of these tags
+pids, ranks, scores = searcher.search(
+    "transformer models",
+    k=10,
+    filters={
+        "tags": {"all": ["nlp", "attention", "bert"]},  # HAS_ALL: contains all
     }
 )
 
@@ -761,9 +1210,18 @@ pids, ranks, scores, facets = searcher.search(
     "machine learning",
     k=100,
     filters={"year": ">=2018"},
-    facet_fields=["category", "source", "year"]
+    facet_fields=["category", "source", "year", "tags"]
 )
-# facets = {"category": {"science": 45, "tech": 30, ...}, "year": {...}, ...}
+# facets = {
+#     "category": {"science": 45, "tech": 30, ...},
+#     "tags": {"python": 67, "ml": 52, "deep-learning": 41, ...},
+#     ...
+# }
+
+# Check cache stats (for debugging/monitoring)
+print(searcher.ranker.adaptive_retrieval.cache.stats())
+# {'corpus_cache_entries': 5, 'selectivity_cache_entries': 12,
+#  'memory_usage_bytes': 42000, 'hits': 150, 'misses': 12, 'hit_rate': 0.926}
 ```
 
 ---
@@ -771,45 +1229,73 @@ pids, ranks, scores, facets = searcher.search(
 ## Implementation Roadmap
 
 ### Phase 1: Core Infrastructure
-- [ ] `GPUMetadataStore` class
-- [ ] `GPUFilter` with basic operators (eq, in, range)
+- [ ] `GPUMetadataStore` class with single-value field support
+- [ ] `GPUInvertedIndex` class for multi-value fields
+- [ ] `GPUFilter` with all operators (eq, in, range, has, has_any, has_all)
 - [ ] Unit tests for GPU operations
 
-### Phase 2: Integration
+### Phase 2: Caching
+- [ ] `FilterCache` with two-level caching
+- [ ] LRU eviction and memory budget management
+- [ ] TTL-based expiration
+- [ ] Cache invalidation on corpus changes
+
+### Phase 3: Adaptive Retrieval
+- [ ] `AdaptiveFilteredRetrieval` with selectivity estimation
+- [ ] Progressive ncells expansion based on selectivity
+- [ ] Brute-force fallback for very selective filters
+- [ ] Integration with FilterCache
+
+### Phase 4: Integration
 - [ ] `FilteredIndexScorer` extending `IndexScorer`
 - [ ] `FilteredSearcher` extending `Searcher`
 - [ ] Backward compatibility with CPU filter_fn
 
-### Phase 3: Adaptive Retrieval
-- [ ] `AdaptiveFilteredRetrieval` with selectivity estimation
-- [ ] Brute-force fallback for very selective filters
-- [ ] Selectivity caching
-
-### Phase 4: Faceting
+### Phase 5: Faceting
 - [ ] `GPUFacetComputer` for fast facet counting
+- [ ] Multi-value field faceting via inverted index
 - [ ] Integration with search API
 
-### Phase 5: Optimization
+### Phase 6: Optimization & Production
 - [ ] Benchmark suite for filtered search
 - [ ] Memory optimization for large vocabularies
 - [ ] Multi-GPU support for metadata store
+- [ ] Incremental update support
 
 ---
 
+## Design Decisions
+
+### Resolved
+
+1. **Variable-length fields**: Use GPU-resident inverted index (GPUInvertedIndex)
+   - Posting lists stored as GPU tensors: `{value_id: tensor of PIDs}`
+   - Memory efficient: O(total_assignments) vs O(n_docs * max_values) for padded
+   - For selective filters, posting list IS the answer (no filtering needed)
+   - Supports OR (union) and AND (intersection) queries efficiently
+
+2. **Filter caching**: Two-level caching strategy (FilterCache)
+   - Level 1: Corpus-wide filter results for selective filters (brute-force path)
+   - Level 2: Selectivity estimates for strategy selection
+   - LRU eviction with memory budget and TTL
+   - Huge wins for repeated selective filter patterns
+
+3. **Index-time partitioning**: Not pursuing
+   - Would require user to specify partition scheme at index time
+   - Combinatorial explosion for multi-dimensional partitioning
+   - Adaptive retrieval + caching handles most cases well
+
 ## Open Questions
 
-1. **Variable-length fields**: How to handle multi-value fields like tags efficiently?
-   - Option A: Padded tensors with max_values limit
-   - Option B: Separate inverted index for multi-value fields
-   - Option C: Explode to multiple rows (increases memory)
-
-2. **Filter caching**: Should we cache filter masks for repeated queries?
-   - Pro: Faster for repeated filter patterns
-   - Con: Memory overhead, cache invalidation complexity
-
-3. **Hybrid CPU/GPU**: For very large metadata vocabularies, should some fields stay on CPU?
+1. **Hybrid CPU/GPU**: For very large metadata vocabularies, should some fields stay on CPU?
    - High-cardinality fields (e.g., author with 1M unique values) may not benefit from GPU
+   - Could use CPU-based bloom filter for pre-screening, then GPU for final filter
 
-4. **Index-time filtering**: Could we pre-partition the IVF index by common filter values?
-   - Would enable true pre-filtering instead of post-filtering
-   - Significant index size increase for multi-dimensional partitioning
+2. **Incremental updates**: How to handle corpus changes?
+   - Current: Invalidate all caches when corpus changes
+   - Future: Incremental updates to metadata tensors and inverted indexes
+   - Challenge: Maintaining posting list consistency during updates
+
+3. **Multi-GPU sharding**: For very large corpora, how to shard metadata?
+   - Option A: Replicate metadata on each GPU (simpler, more memory)
+   - Option B: Shard metadata to match embedding shards (complex, less memory)
