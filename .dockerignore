@@ -1,0 +1,57 @@
+# Docker build context exclusions for ColBERT
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+*.egg
+dist
+build
+.pytest_cache
+.coverage
+htmlcov
+.tox
+.mypy_cache
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# Large data files (mount these instead)
+data/
+experiments/
+indexes/
+checkpoints/
+*.tar.gz
+*.zip
+*.bin
+*.pt
+*.ckpt
+
+# Logs and temp
+*.log
+tmp/
+temp/
+.cache/
+
+# Documentation artifacts
+docs/_build
+
+# OS
+.DS_Store
+Thumbs.db

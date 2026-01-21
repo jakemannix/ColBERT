@@ -1,0 +1,107 @@
+# ColBERT GPU Docker Compose Configuration
+#
+# Usage:
+#   # Build and run interactive shell
+#   docker compose -f docker/docker-compose.yml run --rm colbert bash
+#
+#   # Run benchmarks
+#   docker compose -f docker/docker-compose.yml run --rm colbert python tests/benchmark_gpu_filtering.py
+#
+#   # Run tests
+#   docker compose -f docker/docker-compose.yml run --rm colbert pytest tests/test_gpu_filtering.py -v
+
+services:
+  colbert:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+    image: colbert-gpu:latest
+
+    # GPU configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all  # Use 'count: 1' for single GPU
+              capabilities: [gpu]
+
+    # Shared memory for PyTorch DataLoader
+    shm_size: '32gb'
+
+    # Volume mounts
+    volumes:
+      - ../data:/app/data
+      - ../experiments:/app/experiments
+      - ../indexes:/app/indexes
+      # Mount source for development (optional)
+      # - ..:/app
+
+    # Environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=0
+      - TOKENIZERS_PARALLELISM=false
+
+    # Interactive terminal
+    stdin_open: true
+    tty: true
+
+    # Working directory
+    working_dir: /app
+
+  # Lightweight version
+  colbert-slim:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu-slim
+    image: colbert-gpu-slim:latest
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    shm_size: '16gb'
+
+    volumes:
+      - ../data:/app/data
+      - ../experiments:/app/experiments
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=0
+
+    stdin_open: true
+    tty: true
+    working_dir: /app
+
+  # Benchmark runner
+  benchmark:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+    image: colbert-gpu:latest
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    shm_size: '32gb'
+
+    volumes:
+      - ../data:/app/data
+      - ../results:/app/results
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=0
+
+    command: ["python", "tests/benchmark_gpu_filtering.py"]
