@@ -42,7 +42,18 @@ class CandidateGeneration:
             E = E.cuda()
         return (Q.unsqueeze(0) @ E.unsqueeze(2)).squeeze(-1).T
 
-    def generate_candidates(self, config, Q):
+    def generate_candidates(self, config, Q, materialized_filter=None):
+        """Generate candidate PIDs for query ``Q``.
+
+        When ``materialized_filter`` is not ``None`` the filter's allowed-PID
+        set is applied *during* the IVF cell-list traversal — the downstream
+        sort/unique runs on the already-filtered packed PIDs rather than on
+        the unfiltered union. See ``colbert.search.filtered_search``.
+        """
+        if materialized_filter is not None:
+            from colbert.search.filtered_search import generate_filtered_candidates
+            return generate_filtered_candidates(self, config, Q, materialized_filter)
+
         ncells = config.ncells
 
         assert isinstance(self.ivf, StridedTensor)

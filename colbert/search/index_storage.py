@@ -74,9 +74,11 @@ class IndexScorer(IndexLoader, CandidateGeneration):
     def lookup_pids(self, passage_ids, out_device='cuda', return_mask=False):
         return self.embeddings_strided.lookup_pids(passage_ids, out_device)
 
-    def retrieve(self, config, Q):
+    def retrieve(self, config, Q, materialized_filter=None):
         Q = Q[:, :config.query_maxlen]   # NOTE: Candidate generation uses only the query tokens
-        pids, centroid_scores = self.generate_candidates(config, Q)
+        pids, centroid_scores = self.generate_candidates(
+            config, Q, materialized_filter=materialized_filter
+        )
 
         return pids, centroid_scores
 
@@ -84,10 +86,24 @@ class IndexScorer(IndexLoader, CandidateGeneration):
         all_pids = torch.unique(self.emb2pid[embedding_ids.long()].cuda(), sorted=False)
         return all_pids
 
-    def rank(self, config, Q, filter_fn=None, pids=None):
+    def rank(self, config, Q, filter_fn=None, pids=None, materialized_filter=None):
+        """Score the top docs for query ``Q``.
+
+        Args:
+          materialized_filter: optional :class:`MaterializedFilter`. When set,
+            the filter is applied *in-line* during candidate generation — see
+            ``colbert.search.filtered_search``. Mutually preferred over
+            ``filter_fn`` for selective filters because the candidate set
+            never includes filter-rejected PIDs.
+          filter_fn: legacy post-candidate filter callback. Still applied
+            after candidate generation, including the in-line-filtered case
+            (for stacking custom logic on top).
+        """
         with torch.inference_mode():
             if pids is None:
-                pids, centroid_scores = self.retrieve(config, Q)
+                pids, centroid_scores = self.retrieve(
+                    config, Q, materialized_filter=materialized_filter
+                )
             else:
                 pids = torch.tensor(pids, dtype=torch.int32, device=Q.device)
                 centroid_scores = None
@@ -100,6 +116,9 @@ class IndexScorer(IndexLoader, CandidateGeneration):
                 pids = filtered_pids
                 if len(pids) == 0:
                     return [], []
+
+            if len(pids) == 0:
+                return [], []
 
             scores, pids = self.score_pids(config, Q, pids, centroid_scores)
 
